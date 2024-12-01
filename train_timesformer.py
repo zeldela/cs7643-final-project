@@ -201,8 +201,7 @@ def worker_function(fragment_id, CFG):
 
     return train_images, train_masks, valid_images, valid_masks, valid_xyxys
 
-def get_train_valid_dataset(
-  fragment_ids=['20231210121321','20231016151000', '20231005123336', '20231031143850', '20231005123336','20230820203112']):
+def get_train_valid_dataset(fragment_ids=['20231210121321','20231016151000', '20231005123336', '20231031143850']):
     threads = []
     results = [None] * len(fragment_ids)
 
@@ -327,9 +326,9 @@ class CustomDataset(Dataset):
                 label = data['mask']
                 label=F.interpolate(label.unsqueeze(0),(self.cfg.size//16,self.cfg.size//16)).squeeze(0)
             return image, label
-class RegressionPLModel(pl.LightningModule):
-    def __init__(self,pred_shape,size=256,with_norm=False):
-        super(RegressionPLModel, self).__init__()
+class UNetPLModel(pl.LightningModule):
+    def __init__(self,pred_shape,size=256,encoder_name='resnet34', encoder_weights='imagenet'):
+        super(UNetPLModel, self).__init__()
 
         self.save_hyperparameters()
         self.mask_pred = np.zeros(self.hparams.pred_shape)
@@ -339,29 +338,18 @@ class RegressionPLModel(pl.LightningModule):
         self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
         self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
 
-        self.backbone=TimeSformer(
-                dim = 512,
-                image_size = 64,
-                patch_size = 16,
-                num_frames = 26,
-                num_classes = 16,
-                channels=1,
-                depth = 8,
-                heads = 6,
-                dim_head =  64,
-                attn_dropout = 0.1,
-                ff_dropout = 0.1
-            )
-        if self.hparams.with_norm:
-            self.normalization=nn.BatchNorm3d(num_features=1)
+
+        self.model = smp.Unet(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=1,  
+            classes=1      
+        )
+        
     def forward(self, x):
         if x.ndim==4:
             x=x[:,None]
-        if self.hparams.with_norm:
-            x=self.normalization(x)
-        x = self.backbone(torch.permute(x, (0, 2, 1,3,4)))
-        x=x.view(-1,1,4,4)
-        return x
+        return self.model(x)
     
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -379,7 +367,11 @@ class RegressionPLModel(pl.LightningModule):
         loss1 = self.loss_func(outputs, y)
         y_preds = torch.sigmoid(outputs).to('cpu')
         for i, (x1, y1, x2, y2) in enumerate(xyxys):
-            self.mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=16,mode='bilinear').squeeze(0).squeeze(0).numpy()
+            self.mask_pred[y1:y2, x1:x2] += F.interpolate(
+                y_preds[i].unsqueeze(0).float(),
+                scale_factor=16,
+                mode='bilinear'
+            ).squeeze(0).squeeze(0).numpy()
             self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size))
 
         self.log("val/total_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
@@ -472,7 +464,7 @@ for fid in fragments:
                                 num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
 
     wandb_logger = WandbLogger(project="vesivus",name=run_slug+f'timesformer_big6_finetune')
-    model=RegressionPLModel(pred_shape=pred_shape,size=CFG.size)
+    model=UNetPLModel(pred_shape=pred_shape,size=CFG.size)
     wandb_logger.watch(model, log="all", log_freq=100)
     trainer = pl.Trainer(
         max_epochs=20,
@@ -485,7 +477,7 @@ for fid in fragments:
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
         strategy='ddp_find_unused_parameters_true',
-        callbacks=[ModelCheckpoint(filename=f'timesformer_wild16_{fid}_fr'+'{epoch}',dirpath=CFG.model_dir,monitor='train/total_loss',mode='min',save_top_k=CFG.epochs),
+        callbacks=[ModelCheckpoint(filename=f'timesformer_edit_{fid}_fr'+'{epoch}',dirpath=CFG.model_dir,monitor='train/total_loss',mode='min',save_top_k=CFG.epochs),
 
                     ],
 
